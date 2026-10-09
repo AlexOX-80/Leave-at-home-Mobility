@@ -11,6 +11,8 @@ class OchsMobility extends IPSModule
     {
         parent::Create();
 
+        $this->RegisterPropertyString('FromStopName', '');
+        $this->RegisterPropertyString('ToStopName', '');
         $this->RegisterPropertyString('FromStopId', '');
         $this->RegisterPropertyString('ToStopId', '');
         $this->RegisterPropertyInteger('WalkToStopMinutes', 8);
@@ -26,6 +28,11 @@ class OchsMobility extends IPSModule
 
         $this->RegisterAttributeInteger('TargetArrival', 0);
         $this->RegisterAttributeString('JourneyRefreshToken', '');
+        $this->RegisterAttributeString('ResolvedFromStopId', '');
+        $this->RegisterAttributeString('ResolvedToStopId', '');
+        $this->RegisterAttributeString('ResolvedFromStopName', '');
+        $this->RegisterAttributeString('ResolvedToStopName', '');
+        $this->RegisterAttributeString('ResolutionSignature', '');
 
         $this->RegisterVariableInteger('TargetArrival', 'Gewünschte Ankunft', '~UnixTimestamp', 10);
         $this->RegisterVariableInteger('LeaveHomeAt', 'Haus verlassen', '~UnixTimestamp', 20);
@@ -33,6 +40,8 @@ class OchsMobility extends IPSModule
         $this->RegisterVariableString('MobilityStatus', 'Mobilitätsstatus', '', 40);
         $this->RegisterVariableString('Recommendation', 'Empfehlung', '', 50);
 
+        $this->RegisterVariableString('ResolvedFrom', 'Start-Haltestelle', '', 80);
+        $this->RegisterVariableString('ResolvedTo', 'Ziel-Haltestelle', '', 90);
         $this->RegisterVariableString('JourneySummary', 'Verbindung', '', 100);
         $this->RegisterVariableInteger('JourneyDeparture', 'Abfahrt Verbindung', '~UnixTimestamp', 110);
         $this->RegisterVariableInteger('JourneyArrival', 'Ankunft Verbindung', '~UnixTimestamp', 120);
@@ -40,6 +49,7 @@ class OchsMobility extends IPSModule
         $this->RegisterVariableString('Platform', 'Gleis / Steig', '', 140);
         $this->RegisterVariableBoolean('Cancelled', 'Verbindung ausgefallen', '~Switch', 150);
         $this->RegisterVariableString('Disruptions', 'Hinweise / Störungen', '', 160);
+        $this->RegisterVariableBoolean('JourneyTracked', 'Gewählte Verbindung wird verfolgt', '~Switch', 170);
 
         $this->RegisterVariableInteger('RoadworksCount', 'Straßenstörungen im Korridor', '', 200);
         $this->RegisterVariableString('RoadworksSummary', 'Straßenlage', '', 210);
@@ -56,7 +66,14 @@ class OchsMobility extends IPSModule
         $interval = max(60, $this->ReadPropertyInteger('UpdateIntervalSeconds'));
         $this->SetTimerInterval('UpdateTimer', $interval * 1000);
 
-        if ($this->ReadPropertyString('FromStopId') === '' || $this->ReadPropertyString('ToStopId') === '') {
+        $signature = $this->ConfigurationSignature();
+        if ($signature !== $this->ReadAttributeString('ResolutionSignature')) {
+            $this->ClearResolvedStops();
+            $this->ClearTrackedJourney();
+            $this->WriteAttributeString('ResolutionSignature', $signature);
+        }
+
+        if (!$this->HasStopConfiguration()) {
             $this->SetStatus(201);
         } else {
             $this->SetStatus(102);
@@ -66,6 +83,9 @@ class OchsMobility extends IPSModule
     public function SetTargetArrival(int $timestamp): void
     {
         $timestamp = max(0, $timestamp);
+        if ($timestamp !== $this->ReadAttributeInteger('TargetArrival')) {
+            $this->ClearTrackedJourney();
+        }
         $this->WriteAttributeInteger('TargetArrival', $timestamp);
         $this->SetValue('TargetArrival', $timestamp);
     }
@@ -75,26 +95,63 @@ class OchsMobility extends IPSModule
         $this->SetTargetArrival(0);
     }
 
+    public function ResolveStops(): bool
+    {
+        try {
+            [$fromId, $toId] = $this->ResolveConfiguredStops(true);
+            $this->SetValue('LastError', '');
+            $this->SetStatus(102);
+            return $fromId !== '' && $toId !== '';
+        } catch (Throwable $e) {
+            $this->SetValue('LastError', $e->getMessage());
+            $this->SetStatus(202);
+            return false;
+        }
+    }
+
+    public function ResetJourney(): void
+    {
+        $this->ClearTrackedJourney();
+        $this->SetValue('Recommendation', 'Verbindungsauswahl wurde zurückgesetzt');
+    }
+
     public function Update(): bool
     {
-        $from = trim($this->ReadPropertyString('FromStopId'));
-        $to = trim($this->ReadPropertyString('ToStopId'));
-
-        if ($from === '' || $to === '') {
+        if (!$this->HasStopConfiguration()) {
             $this->SetStatus(201);
-            $this->SetValue('LastError', 'Start- oder Ziel-Haltestelle fehlt.');
+            $this->SetValue('LastError', 'Start- oder Ziel-Haltestelle fehlt. Name oder ID eintragen.');
             return false;
         }
 
         $target = $this->ReadAttributeInteger('TargetArrival');
         if ($target <= time()) {
             $target = time() + ($this->ReadPropertyInteger('DefaultArrivalLeadMinutes') * 60);
+            $this->WriteAttributeInteger('TargetArrival', $target);
             $this->SetValue('TargetArrival', $target);
+            $this->ClearTrackedJourney();
         }
 
         try {
-            $journey = $this->FetchJourney($from, $to, $target);
-            $this->ApplyJourney($journey, $target);
+            [$from, $to] = $this->ResolveConfiguredStops(false);
+
+            $journey = null;
+            $tracked = false;
+            $refreshToken = $this->ReadAttributeString('JourneyRefreshToken');
+            if ($refreshToken !== '') {
+                try {
+                    $journey = $this->RefreshJourney($refreshToken);
+                    $tracked = true;
+                } catch (Throwable $refreshError) {
+                    $this->SendDebug('Journey refresh failed', $refreshError->getMessage(), 0);
+                    $this->ClearTrackedJourney();
+                }
+            }
+
+            if ($journey === null) {
+                $journey = $this->FetchJourney($from, $to, $target);
+            }
+
+            $this->ApplyJourney($journey, $target, $tracked);
 
             if ($this->ReadPropertyBoolean('EnableRoadworks')) {
                 $this->UpdateRoadworks();
@@ -114,6 +171,113 @@ class OchsMobility extends IPSModule
             $this->SetStatus(202);
             return false;
         }
+    }
+
+    private function HasStopConfiguration(): bool
+    {
+        $from = trim($this->ReadPropertyString('FromStopId')) !== '' || trim($this->ReadPropertyString('FromStopName')) !== '';
+        $to = trim($this->ReadPropertyString('ToStopId')) !== '' || trim($this->ReadPropertyString('ToStopName')) !== '';
+        return $from && $to;
+    }
+
+    private function ResolveConfiguredStops(bool $force): array
+    {
+        $fromOverride = trim($this->ReadPropertyString('FromStopId'));
+        $toOverride = trim($this->ReadPropertyString('ToStopId'));
+        $fromName = trim($this->ReadPropertyString('FromStopName'));
+        $toName = trim($this->ReadPropertyString('ToStopName'));
+
+        $resolvedFrom = $force ? '' : $this->ReadAttributeString('ResolvedFromStopId');
+        $resolvedTo = $force ? '' : $this->ReadAttributeString('ResolvedToStopId');
+
+        if ($fromOverride !== '') {
+            $resolvedFrom = $fromOverride;
+            $resolvedFromName = $fromName !== '' ? $fromName : $fromOverride;
+        } elseif ($resolvedFrom === '') {
+            $hit = $this->ResolveStopName($fromName);
+            $resolvedFrom = $hit['id'];
+            $resolvedFromName = $hit['name'];
+        } else {
+            $resolvedFromName = $this->ReadAttributeString('ResolvedFromStopName');
+        }
+
+        if ($toOverride !== '') {
+            $resolvedTo = $toOverride;
+            $resolvedToName = $toName !== '' ? $toName : $toOverride;
+        } elseif ($resolvedTo === '') {
+            $hit = $this->ResolveStopName($toName);
+            $resolvedTo = $hit['id'];
+            $resolvedToName = $hit['name'];
+        } else {
+            $resolvedToName = $this->ReadAttributeString('ResolvedToStopName');
+        }
+
+        if ($resolvedFrom === '' || $resolvedTo === '') {
+            throw new RuntimeException('Start- oder Ziel-Haltestelle konnte nicht aufgelöst werden.');
+        }
+
+        $this->WriteAttributeString('ResolvedFromStopId', $resolvedFrom);
+        $this->WriteAttributeString('ResolvedToStopId', $resolvedTo);
+        $this->WriteAttributeString('ResolvedFromStopName', $resolvedFromName);
+        $this->WriteAttributeString('ResolvedToStopName', $resolvedToName);
+        $this->SetValue('ResolvedFrom', $resolvedFromName . ' [' . $resolvedFrom . ']');
+        $this->SetValue('ResolvedTo', $resolvedToName . ' [' . $resolvedTo . ']');
+
+        return [$resolvedFrom, $resolvedTo];
+    }
+
+    private function ResolveStopName(string $query): array
+    {
+        if ($query === '') {
+            throw new RuntimeException('Haltestellenname ist leer.');
+        }
+
+        $params = http_build_query([
+            'query' => $query,
+            'results' => 5,
+            'stops' => 'true',
+            'addresses' => 'false',
+            'poi' => 'false',
+            'linesOfStops' => 'false',
+            'language' => 'de',
+            'profile' => 'dbnav',
+            'pretty' => 'false'
+        ]);
+        $data = $this->HttpJson(self::TRANSPORT_BASE . '/locations?' . $params);
+        if (!is_array($data) || count($data) === 0) {
+            throw new RuntimeException('Keine Haltestelle für „' . $query . '“ gefunden.');
+        }
+
+        $best = null;
+        $queryNorm = $this->NormalizeText($query);
+        foreach ($data as $candidate) {
+            if (($candidate['type'] ?? '') !== 'stop' || empty($candidate['id']) || empty($candidate['name'])) {
+                continue;
+            }
+            $candidateNorm = $this->NormalizeText((string) $candidate['name']);
+            $score = 0;
+            if ($candidateNorm === $queryNorm) {
+                $score = 100;
+            } elseif (strpos($candidateNorm, $queryNorm) === 0) {
+                $score = 80;
+            } elseif (strpos($candidateNorm, $queryNorm) !== false) {
+                $score = 60;
+            } else {
+                $score = 10;
+            }
+            if ($best === null || $score > $best['score']) {
+                $best = [
+                    'id' => (string) $candidate['id'],
+                    'name' => (string) $candidate['name'],
+                    'score' => $score
+                ];
+            }
+        }
+
+        if ($best === null) {
+            throw new RuntimeException('Keine verwertbare Haltestelle für „' . $query . '“ gefunden.');
+        }
+        return ['id' => $best['id'], 'name' => $best['name']];
     }
 
     private function FetchJourney(string $from, string $to, int $arrivalTs): array
@@ -153,11 +317,21 @@ class OchsMobility extends IPSModule
         if ($best === null) {
             $best = $journeys[0];
         }
-
         return $best;
     }
 
-    private function ApplyJourney(array $journey, int $targetArrival): void
+    private function RefreshJourney(string $refreshToken): array
+    {
+        $url = self::TRANSPORT_BASE . '/journeys/' . rawurlencode($refreshToken) . '?remarks=true&language=de&profile=dbnav&pretty=false';
+        $data = $this->HttpJson($url);
+        $journey = $data['journey'] ?? $data;
+        if (!is_array($journey) || !isset($journey['legs'])) {
+            throw new RuntimeException('Journey-Refresh lieferte keine verwertbare Verbindung.');
+        }
+        return $journey;
+    }
+
+    private function ApplyJourney(array $journey, int $targetArrival, bool $wasTracked): void
     {
         $times = $this->JourneyTimes($journey);
         $departure = $times['departure'];
@@ -181,22 +355,26 @@ class OchsMobility extends IPSModule
         $recommendation = 'Planmäßig losfahren';
         if ($cancelled) {
             $status = 'AUSFALL';
-            $recommendation = 'Alternative Verbindung oder anderes Verkehrsmittel prüfen';
+            $recommendation = 'Gewählte Verbindung ist ausgefallen – Alternative prüfen';
+        } elseif ($arrival > $targetArrival) {
+            $status = 'ZU SPÄT';
+            $recommendation = 'Gewählte Verbindung erreicht das Ziel nach der Wunschzeit';
         } elseif ($minutesToLeave <= 0) {
             $status = 'JETZT LOS';
             $recommendation = 'Jetzt das Haus verlassen';
         } elseif ($minutesToLeave <= 10) {
             $status = 'BALD LOS';
             $recommendation = 'In ' . $minutesToLeave . ' min das Haus verlassen';
-        } elseif ($arrival > $targetArrival) {
-            $status = 'ZU SPÄT';
-            $recommendation = 'Diese Verbindung erreicht das Ziel nach der Wunschzeit';
         } elseif ($delay >= 10) {
             $status = 'VERSPÄTET';
-            $recommendation = 'Verspätung beobachten; Abfahrtszeit wurde neu berechnet';
+            $recommendation = 'Gewählte Verbindung +' . $delay . ' min; Abfahrtszeit neu berechnet';
         }
 
-        $this->WriteAttributeString('JourneyRefreshToken', (string) ($journey['refreshToken'] ?? ''));
+        $newToken = (string) ($journey['refreshToken'] ?? '');
+        if ($newToken !== '') {
+            $this->WriteAttributeString('JourneyRefreshToken', $newToken);
+        }
+
         $this->SetValue('LeaveHomeAt', $leave);
         $this->SetValue('MinutesToLeave', $minutesToLeave);
         $this->SetValue('MobilityStatus', $status);
@@ -208,6 +386,7 @@ class OchsMobility extends IPSModule
         $this->SetValue('Platform', $platform);
         $this->SetValue('Cancelled', $cancelled);
         $this->SetValue('Disruptions', $remarks);
+        $this->SetValue('JourneyTracked', $wasTracked || $newToken !== '');
     }
 
     private function JourneyTimes(array $journey): array
@@ -236,16 +415,19 @@ class OchsMobility extends IPSModule
 
     private function JourneyDelayMinutes(array $journey): int
     {
+        $maxDelay = 0;
         foreach (($journey['legs'] ?? []) as $leg) {
             if (($leg['walking'] ?? false) === true) {
                 continue;
             }
-            $delay = $leg['departureDelay'] ?? $leg['arrivalDelay'] ?? null;
-            if (is_numeric($delay)) {
-                return (int) round(((int) $delay) / 60);
+            foreach (['departureDelay', 'arrivalDelay'] as $key) {
+                $delay = $leg[$key] ?? null;
+                if (is_numeric($delay)) {
+                    $maxDelay = max($maxDelay, (int) round(((int) $delay) / 60));
+                }
             }
         }
-        return 0;
+        return $maxDelay;
     }
 
     private function JourneyPlatform(array $journey): string
@@ -332,8 +514,9 @@ class OchsMobility extends IPSModule
             }
         }
 
+        $hits = array_values(array_unique($hits));
         $this->SetValue('RoadworksCount', count($hits));
-        $this->SetValue('RoadworksSummary', count($hits) > 0 ? implode(' | ', array_values(array_unique($hits))) : 'Keine Baustelle im konfigurierten Korridor erkannt');
+        $this->SetValue('RoadworksSummary', count($hits) > 0 ? implode(' | ', $hits) : 'Keine Baustelle im konfigurierten Korridor erkannt');
     }
 
     private function RepresentativePoint(array $geometry): ?array
@@ -356,18 +539,20 @@ class OchsMobility extends IPSModule
         $refLat = deg2rad(($lat1 + $lat2 + $lat) / 3.0);
         $kx = 111.320 * cos($refLat);
         $ky = 110.574;
-        $px = $lon * $kx; $py = $lat * $ky;
-        $x1 = $lon1 * $kx; $y1 = $lat1 * $ky;
-        $x2 = $lon2 * $kx; $y2 = $lat2 * $ky;
-        $dx = $x2 - $x1; $dy = $y2 - $y1;
-        $len2 = ($dx * $dx) + ($dy * $dy);
-        if ($len2 <= 0.000001) {
-            return sqrt((($px - $x1) ** 2) + (($py - $y1) ** 2));
+        $px = $lon * $kx;
+        $py = $lat * $ky;
+        $x1 = $lon1 * $kx;
+        $y1 = $lat1 * $ky;
+        $x2 = $lon2 * $kx;
+        $y2 = $lat2 * $ky;
+        $dx = $x2 - $x1;
+        $dy = $y2 - $y1;
+        if ($dx == 0.0 && $dy == 0.0) {
+            return hypot($px - $x1, $py - $y1);
         }
-        $t = (($px - $x1) * $dx + ($py - $y1) * $dy) / $len2;
+        $t = (($px - $x1) * $dx + ($py - $y1) * $dy) / (($dx * $dx) + ($dy * $dy));
         $t = max(0.0, min(1.0, $t));
-        $cx = $x1 + $t * $dx; $cy = $y1 + $t * $dy;
-        return sqrt((($px - $cx) ** 2) + (($py - $cy) ** 2));
+        return hypot($px - ($x1 + $t * $dx), $py - ($y1 + $t * $dy));
     }
 
     private function FirstNonEmpty(array $data, array $keys): string
@@ -392,26 +577,27 @@ class OchsMobility extends IPSModule
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT => 12,
-            CURLOPT_HTTPHEADER => [
-                'Accept: application/json',
-                'User-Agent: OchsSmartHome-Mobility/0.1'
-            ]
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_TIMEOUT => 15,
+            CURLOPT_USERAGENT => 'IP-Symcon OchsMobility/0.2',
+            CURLOPT_HTTPHEADER => ['Accept: application/json']
         ]);
         $body = curl_exec($ch);
-        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $error = curl_error($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
-        if ($body === false || $status < 200 || $status >= 300) {
-            throw new RuntimeException('HTTP-Fehler ' . $status . ($error !== '' ? ': ' . $error : ''));
+        if ($body === false || $error !== '') {
+            throw new RuntimeException('HTTP-Fehler: ' . $error);
         }
-        $json = json_decode((string) $body, true);
-        if (!is_array($json)) {
-            throw new RuntimeException('Ungültige JSON-Antwort von Datenquelle.');
+        if ($status < 200 || $status >= 300) {
+            throw new RuntimeException('Datenquelle antwortet mit HTTP ' . $status . '.');
         }
-        return $json;
+        $decoded = json_decode((string) $body, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException('Datenquelle lieferte ungültiges JSON.');
+        }
+        return $decoded;
     }
 
     private function IsoToTs(string $value): int
@@ -419,7 +605,42 @@ class OchsMobility extends IPSModule
         if ($value === '') {
             return 0;
         }
-        $ts = strtotime($value);
-        return $ts === false ? 0 : $ts;
+        $timestamp = strtotime($value);
+        return $timestamp === false ? 0 : $timestamp;
+    }
+
+    private function NormalizeText(string $value): string
+    {
+        $value = trim($value);
+        if (function_exists('mb_strtolower')) {
+            return mb_strtolower($value, 'UTF-8');
+        }
+        return strtolower($value);
+    }
+
+    private function ConfigurationSignature(): string
+    {
+        return sha1(implode('|', [
+            trim($this->ReadPropertyString('FromStopName')),
+            trim($this->ReadPropertyString('ToStopName')),
+            trim($this->ReadPropertyString('FromStopId')),
+            trim($this->ReadPropertyString('ToStopId'))
+        ]));
+    }
+
+    private function ClearResolvedStops(): void
+    {
+        $this->WriteAttributeString('ResolvedFromStopId', '');
+        $this->WriteAttributeString('ResolvedToStopId', '');
+        $this->WriteAttributeString('ResolvedFromStopName', '');
+        $this->WriteAttributeString('ResolvedToStopName', '');
+        $this->SetValue('ResolvedFrom', '');
+        $this->SetValue('ResolvedTo', '');
+    }
+
+    private function ClearTrackedJourney(): void
+    {
+        $this->WriteAttributeString('JourneyRefreshToken', '');
+        $this->SetValue('JourneyTracked', false);
     }
 }
