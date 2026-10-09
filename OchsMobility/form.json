@@ -2,39 +2,23 @@
   "elements": [
     {
       "type": "Label",
-      "caption": "Ochs Mobility berechnet aus Echtzeit-ÖPNV, optional DB Timetables und Straßenmeldungen, wann das Haus verlassen werden sollte."
+      "caption": "Ochs Mobility nutzt für Bahnverbindungen nur die offizielle DB Timetables API. Aktuell werden direkte Verbindungen erkannt und in Echtzeit überwacht."
     },
     {
       "type": "ExpansionPanel",
-      "caption": "ÖPNV / Verbindung",
+      "caption": "DB Timetables / Direktverbindung",
       "items": [
-        {"type": "ValidationTextBox", "name": "FromStopName", "caption": "Start-Haltestelle (Name, z. B. Ehingen (Donau))"},
-        {"type": "ValidationTextBox", "name": "ToStopName", "caption": "Ziel-Haltestelle (Name, z. B. Ulm Hbf)"},
-        {"type": "ValidationTextBox", "name": "FromStopId", "caption": "Start-Haltestellen-ID (optional, überschreibt Name)"},
-        {"type": "ValidationTextBox", "name": "ToStopId", "caption": "Ziel-Haltestellen-ID (optional, überschreibt Name)"},
-        {"type": "NumberSpinner", "name": "WalkToStopMinutes", "caption": "Weg Haus → Haltestelle (min)", "minimum": 0, "maximum": 60},
-        {"type": "NumberSpinner", "name": "SafetyBufferMinutes", "caption": "Sicherheitspuffer (min)", "minimum": 0, "maximum": 60},
-        {"type": "NumberSpinner", "name": "DefaultArrivalLeadMinutes", "caption": "Wenn kein Termin gesetzt: gewünschte Ankunft in (min)", "minimum": 15, "maximum": 720}
-      ]
-    },
-    {
-      "type": "ExpansionPanel",
-      "caption": "Provider / Ausfallsicherheit",
-      "items": [
-        {"type": "CheckBox", "name": "EnableTransitousFallback", "caption": "Transitous/MOTIS als Fallback verwenden"},
-        {"type": "NumberSpinner", "name": "StaleCacheMinutes", "caption": "Letzte gültige Verbindung bei Ausfall weiterverwenden (min)", "minimum": 5, "maximum": 720},
-        {"type": "Label", "caption": "Bei 429/502/503/504 wird transport.rest automatisch erneut versucht; danach wird Transitous verwendet. Sind beide nicht verfügbar, bleibt die letzte gültige Verbindung als veraltet sichtbar."}
-      ]
-    },
-    {
-      "type": "ExpansionPanel",
-      "caption": "DB Timetables (offizielle kostenlose Echtzeit-Verifikation)",
-      "items": [
-        {"type": "CheckBox", "name": "EnableDBTimetables", "caption": "DB Timetables aktivieren"},
+        {"type": "ValidationTextBox", "name": "FromStopName", "caption": "Startbahnhof (Name, z. B. Ehingen (Donau))"},
+        {"type": "ValidationTextBox", "name": "ToStopName", "caption": "Zielbahnhof (Name, z. B. Aulendorf)"},
+        {"type": "ValidationTextBox", "name": "FromStopId", "caption": "Start-EVA (optional, z. B. 8001684)"},
+        {"type": "ValidationTextBox", "name": "ToStopId", "caption": "Ziel-EVA (optional, z. B. 8000014)"},
         {"type": "ValidationTextBox", "name": "DBClientId", "caption": "DB Client ID"},
         {"type": "PasswordTextBox", "name": "DBApiKey", "caption": "DB API Key"},
-        {"type": "ValidationTextBox", "name": "DBEvaNumber", "caption": "Startbahnhof EVA-Nummer (optional; sonst automatische Suche)"},
-        {"type": "Label", "caption": "Timetables ist fail-open: Bei fehlenden Zugangsdaten oder DB-Fehlern läuft die Routing-Verbindung weiter."}
+        {"type": "NumberSpinner", "name": "WalkToStopMinutes", "caption": "Weg Haus → Bahnhof (min)", "minimum": 0, "maximum": 60},
+        {"type": "NumberSpinner", "name": "SafetyBufferMinutes", "caption": "Sicherheitspuffer (min)", "minimum": 0, "maximum": 60},
+        {"type": "NumberSpinner", "name": "DefaultArrivalLeadMinutes", "caption": "Wenn kein Termin gesetzt: gewünschte Ankunft in (min)", "minimum": 15, "maximum": 720},
+        {"type": "NumberSpinner", "name": "LookAheadHours", "caption": "Suchfenster für Direktfahrten (Stunden)", "minimum": 1, "maximum": 8},
+        {"type": "Label", "caption": "Hinweis: Die kostenlose Timetables API ist keine allgemeine A→B-Routing-API. Bis RIS::Journeys freigeschaltet ist, werden daher nur Direktverbindungen ausgewählt."}
       ]
     },
     {
@@ -58,14 +42,14 @@
     }
   ],
   "actions": [
-    {"type": "Button", "caption": "Haltestellen jetzt auflösen", "onClick": "OMOB_ResolveStops($id);"},
+    {"type": "Button", "caption": "DB-Bahnhöfe auflösen", "onClick": "OMOB_ResolveStops($id);"},
     {"type": "Button", "caption": "Jetzt aktualisieren", "onClick": "OMOB_Update($id);"},
-    {"type": "Button", "caption": "Gewählte Verbindung zurücksetzen", "onClick": "OMOB_ResetJourney($id);"},
+    {"type": "Button", "caption": "Verbindung zurücksetzen", "onClick": "OMOB_ResetJourney($id);"},
     {"type": "Button", "caption": "Testtermin: Ankunft in 60 Minuten", "onClick": "OMOB_SetTargetArrival($id, time() + 3600); OMOB_Update($id);"}
   ],
   "status": [
     {"code": 102, "icon": "active", "caption": "Aktiv"},
-    {"code": 201, "icon": "error", "caption": "Start/Ziel fehlt"},
-    {"code": 202, "icon": "error", "caption": "Alle Routing-Datenquellen nicht erreichbar"}
+    {"code": 201, "icon": "error", "caption": "DB-Zugang oder Start/Ziel fehlt"},
+    {"code": 202, "icon": "error", "caption": "DB Timetables Fehler / keine passende Direktverbindung"}
   ]
 }
