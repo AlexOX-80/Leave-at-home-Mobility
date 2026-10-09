@@ -2,7 +2,7 @@
   "elements": [
     {
       "type": "Label",
-      "caption": "Ochs Mobility berechnet aus Echtzeit-ÖPNV und optionalen Straßenmeldungen, wann das Haus verlassen werden sollte."
+      "caption": "Ochs Mobility berechnet aus Echtzeit-ÖPNV, optional DB Timetables und Straßenmeldungen, wann das Haus verlassen werden sollte."
     },
     {
       "type": "ExpansionPanel",
@@ -15,6 +15,17 @@
         {"type": "NumberSpinner", "name": "WalkToStopMinutes", "caption": "Weg Haus → Haltestelle (min)", "minimum": 0, "maximum": 60},
         {"type": "NumberSpinner", "name": "SafetyBufferMinutes", "caption": "Sicherheitspuffer (min)", "minimum": 0, "maximum": 60},
         {"type": "NumberSpinner", "name": "DefaultArrivalLeadMinutes", "caption": "Wenn kein Termin gesetzt: gewünschte Ankunft in (min)", "minimum": 15, "maximum": 720}
+      ]
+    },
+    {
+      "type": "ExpansionPanel",
+      "caption": "DB Timetables (offizielle kostenlose Echtzeit-Verifikation)",
+      "items": [
+        {"type": "CheckBox", "name": "EnableDBTimetables", "caption": "DB Timetables aktivieren"},
+        {"type": "ValidationTextBox", "name": "DBClientId", "caption": "DB Client ID"},
+        {"type": "PasswordTextBox", "name": "DBApiKey", "caption": "DB API Key"},
+        {"type": "ValidationTextBox", "name": "DBEvaNumber", "caption": "Startbahnhof EVA-Nummer (optional; sonst automatische Suche)"},
+        {"type": "Label", "caption": "Timetables ist fail-open: Bei fehlenden Zugangsdaten oder DB-Fehlern läuft die bestehende transport.rest-Verbindung weiter."}
       ]
     },
     {
