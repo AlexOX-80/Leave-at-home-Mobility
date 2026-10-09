@@ -1,0 +1,11 @@
+{
+  "id": "{B2D3409A-B8B4-4C47-AF7B-0A8E4B51D6C4}",
+  "name": "OchsMobility",
+  "type": 3,
+  "vendor": "Ochs Smart Home",
+  "aliases": ["Ochs Mobility", "Haus verlassen"],
+  "parentRequirements": [],
+  "childRequirements": [],
+  "implemented": [],
+  "prefix": "OMOB"
+}
