@@ -1,0 +1,47 @@
+{
+  "elements": [
+    {
+      "type": "Label",
+      "caption": "Ochs Mobility berechnet aus Echtzeit-ÖPNV und optionalen Straßenmeldungen, wann das Haus verlassen werden sollte."
+    },
+    {
+      "type": "ExpansionPanel",
+      "caption": "ÖPNV / Verbindung",
+      "items": [
+        {"type": "ValidationTextBox", "name": "FromStopId", "caption": "Start-Haltestelle (ID)"},
+        {"type": "ValidationTextBox", "name": "ToStopId", "caption": "Ziel-Haltestelle (ID)"},
+        {"type": "NumberSpinner", "name": "WalkToStopMinutes", "caption": "Weg Haus → Haltestelle (min)", "minimum": 0, "maximum": 60},
+        {"type": "NumberSpinner", "name": "SafetyBufferMinutes", "caption": "Sicherheitspuffer (min)", "minimum": 0, "maximum": 60},
+        {"type": "NumberSpinner", "name": "DefaultArrivalLeadMinutes", "caption": "Wenn kein Termin gesetzt: gewünschte Ankunft in (min)", "minimum": 15, "maximum": 720}
+      ]
+    },
+    {
+      "type": "ExpansionPanel",
+      "caption": "Straßenlage Baden-Württemberg",
+      "items": [
+        {"type": "CheckBox", "name": "EnableRoadworks", "caption": "MobiData BW Baustellen berücksichtigen"},
+        {"type": "NumberSpinner", "name": "HomeLatitude", "caption": "Start-Breitengrad", "digits": 6},
+        {"type": "NumberSpinner", "name": "HomeLongitude", "caption": "Start-Längengrad", "digits": 6},
+        {"type": "NumberSpinner", "name": "DestinationLatitude", "caption": "Ziel-Breitengrad", "digits": 6},
+        {"type": "NumberSpinner", "name": "DestinationLongitude", "caption": "Ziel-Längengrad", "digits": 6},
+        {"type": "NumberSpinner", "name": "RoadCorridorKm", "caption": "Korridor um Luftlinie (km)", "minimum": 1, "maximum": 50}
+      ]
+    },
+    {
+      "type": "ExpansionPanel",
+      "caption": "Aktualisierung",
+      "items": [
+        {"type": "NumberSpinner", "name": "UpdateIntervalSeconds", "caption": "Aktualisierungsintervall (s)", "minimum": 60, "maximum": 1800}
+      ]
+    }
+  ],
+  "actions": [
+    {"type": "Button", "caption": "Jetzt aktualisieren", "onClick": "OMOB_Update($id);"},
+    {"type": "Button", "caption": "Testtermin: Ankunft in 60 Minuten", "onClick": "OMOB_SetTargetArrival($id, time() + 3600); OMOB_Update($id);"}
+  ],
+  "status": [
+    {"code": 102, "icon": "active", "caption": "Aktiv"},
+    {"code": 201, "icon": "error", "caption": "Start/Ziel fehlt"},
+    {"code": 202, "icon": "error", "caption": "Datenquelle nicht erreichbar"}
+  ]
+}
