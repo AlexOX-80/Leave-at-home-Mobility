@@ -19,13 +19,22 @@
     },
     {
       "type": "ExpansionPanel",
+      "caption": "Provider / Ausfallsicherheit",
+      "items": [
+        {"type": "CheckBox", "name": "EnableTransitousFallback", "caption": "Transitous/MOTIS als Fallback verwenden"},
+        {"type": "NumberSpinner", "name": "StaleCacheMinutes", "caption": "Letzte gültige Verbindung bei Ausfall weiterverwenden (min)", "minimum": 5, "maximum": 720},
+        {"type": "Label", "caption": "Bei 429/502/503/504 wird transport.rest automatisch erneut versucht; danach wird Transitous verwendet. Sind beide nicht verfügbar, bleibt die letzte gültige Verbindung als veraltet sichtbar."}
+      ]
+    },
+    {
+      "type": "ExpansionPanel",
       "caption": "DB Timetables (offizielle kostenlose Echtzeit-Verifikation)",
       "items": [
         {"type": "CheckBox", "name": "EnableDBTimetables", "caption": "DB Timetables aktivieren"},
         {"type": "ValidationTextBox", "name": "DBClientId", "caption": "DB Client ID"},
         {"type": "PasswordTextBox", "name": "DBApiKey", "caption": "DB API Key"},
         {"type": "ValidationTextBox", "name": "DBEvaNumber", "caption": "Startbahnhof EVA-Nummer (optional; sonst automatische Suche)"},
-        {"type": "Label", "caption": "Timetables ist fail-open: Bei fehlenden Zugangsdaten oder DB-Fehlern läuft die bestehende transport.rest-Verbindung weiter."}
+        {"type": "Label", "caption": "Timetables ist fail-open: Bei fehlenden Zugangsdaten oder DB-Fehlern läuft die Routing-Verbindung weiter."}
       ]
     },
     {
@@ -57,6 +66,6 @@
   "status": [
     {"code": 102, "icon": "active", "caption": "Aktiv"},
     {"code": 201, "icon": "error", "caption": "Start/Ziel fehlt"},
-    {"code": 202, "icon": "error", "caption": "Datenquelle nicht erreichbar / Auflösung fehlgeschlagen"}
+    {"code": 202, "icon": "error", "caption": "Alle Routing-Datenquellen nicht erreichbar"}
   ]
 }
