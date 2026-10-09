@@ -5,9 +5,10 @@ declare(strict_types=1);
 class OchsMobility extends IPSModule
 {
     private const TRANSPORT_BASE = 'https://v6.db.transport.rest';
-    private const TRANSITOUS_BASE = 'https://api.transitous.org/api/v6';
+    private const TRANSITOUS_ROOT = 'https://api.transitous.org';
     private const DB_TIMETABLES_BASE = 'https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1';
     private const MOBIDATA_ROADWORKS = 'https://api.mobidata-bw.de/datasets/traffic/roadworks/roadworks_geojson.json';
+    private const UA = 'OchsMobility/0.5 https://github.com/AlexOX-80/Leave-at-home-Mobility';
 
     public function Create()
     {
@@ -56,6 +57,7 @@ class OchsMobility extends IPSModule
         $this->RegisterVariableString('Recommendation', 'Empfehlung', '', 50);
         $this->RegisterVariableString('RoutingProvider', 'Routing-Provider', '', 60);
         $this->RegisterVariableBoolean('DataStale', 'Daten veraltet', '~Switch', 70);
+        $this->RegisterVariableString('ProviderDiagnostics', 'Provider-Diagnose', '', 75);
 
         $this->RegisterVariableString('ResolvedFrom', 'Start-Haltestelle', '', 80);
         $this->RegisterVariableString('ResolvedTo', 'Ziel-Haltestelle', '', 90);
@@ -86,6 +88,7 @@ class OchsMobility extends IPSModule
     {
         parent::ApplyChanges();
         $this->SetTimerInterval('UpdateTimer', max(60, $this->ReadPropertyInteger('UpdateIntervalSeconds')) * 1000);
+
         $signature = $this->ConfigurationSignature();
         if ($signature !== $this->ReadAttributeString('ResolutionSignature')) {
             $this->ClearResolvedStops();
@@ -152,7 +155,7 @@ class OchsMobility extends IPSModule
             $journey = $this->FetchResilientJourney($from, $to, $target);
             $official = null;
 
-            if ($this->ReadPropertyBoolean('EnableDBTimetables') && $this->HasDBCredentials() && ($journey['rawTransport'] ?? null) !== null) {
+            if ($this->ReadPropertyBoolean('EnableDBTimetables') && $this->HasDBCredentials() && is_array($journey['rawTransport'] ?? null)) {
                 try {
                     $official = $this->VerifyWithDBTimetables($journey['rawTransport']);
                     $this->SetValue('DBTimetablesStatus', $official === null ? 'Kein passender DB-Treffer' : 'Offiziell verifiziert');
@@ -161,6 +164,8 @@ class OchsMobility extends IPSModule
                 }
             } elseif (!$this->ReadPropertyBoolean('EnableDBTimetables')) {
                 $this->SetValue('DBTimetablesStatus', 'Deaktiviert');
+            } elseif (!$this->HasDBCredentials()) {
+                $this->SetValue('DBTimetablesStatus', 'Aktiviert, aber Zugangsdaten fehlen');
             }
 
             $this->ApplyNormalizedJourney($journey, $target, $official);
@@ -168,9 +173,12 @@ class OchsMobility extends IPSModule
             try {
                 if ($this->ReadPropertyBoolean('EnableRoadworks')) {
                     $this->UpdateRoadworks();
+                } else {
+                    $this->SetValue('RoadworksCount', 0);
+                    $this->SetValue('RoadworksSummary', 'Straßenlage deaktiviert');
                 }
             } catch (Throwable $e) {
-                $this->SetValue('RoadworksSummary', 'Straßenlage derzeit nicht verfügbar');
+                $this->SetValue('RoadworksSummary', 'Straßenlage derzeit nicht verfügbar: ' . $e->getMessage());
             }
 
             $this->SetValue('LastUpdate', time());
@@ -195,33 +203,41 @@ class OchsMobility extends IPSModule
 
     private function FetchResilientJourney(string $from, string $to, int $target): array
     {
-        $errors = [];
+        $diag = [];
+
         try {
             $refreshToken = $this->ReadAttributeString('JourneyRefreshToken');
             $raw = $refreshToken !== '' ? $this->RefreshJourney($refreshToken) : $this->FetchTransportJourney($from, $to, $target);
             $journey = $this->NormalizeTransportJourney($raw);
+            $diag[] = 'transport.rest Routing: OK';
+            $this->SetValue('ProviderDiagnostics', implode(' | ', $diag));
             $this->SetValue('RoutingProvider', 'transport.rest');
             $this->SetValue('DataStale', false);
             $this->SaveCachedJourney($journey);
             return $journey;
         } catch (Throwable $e) {
-            $errors[] = 'transport.rest: ' . $e->getMessage();
+            $diag[] = 'transport.rest Routing: ' . $e->getMessage();
             $this->ClearTrackedJourney();
         }
 
         if ($this->ReadPropertyBoolean('EnableTransitousFallback')) {
             try {
-                $journey = $this->FetchTransitousJourney($target);
+                $journey = $this->FetchTransitousJourney($target, $diag);
+                $diag[] = 'Transitous Routing: OK';
+                $this->SetValue('ProviderDiagnostics', implode(' | ', $diag));
                 $this->SetValue('RoutingProvider', 'Transitous');
                 $this->SetValue('DataStale', false);
                 $this->SaveCachedJourney($journey);
                 return $journey;
             } catch (Throwable $e) {
-                $errors[] = 'Transitous: ' . $e->getMessage();
+                $diag[] = 'Transitous Routing: ' . $e->getMessage();
             }
+        } else {
+            $diag[] = 'Transitous: deaktiviert';
         }
 
-        throw new RuntimeException(implode(' | ', $errors));
+        $this->SetValue('ProviderDiagnostics', implode(' | ', $diag));
+        throw new RuntimeException(implode(' | ', $diag));
     }
 
     private function FetchTransportJourney(string $from, string $to, int $arrivalTs): array
@@ -242,16 +258,17 @@ class OchsMobility extends IPSModule
         if (!is_array($journeys) || count($journeys) === 0) {
             throw new RuntimeException('Keine ÖPNV-Verbindung gefunden.');
         }
+
         $best = null;
         $bestArrival = 0;
         foreach ($journeys as $candidate) {
             $times = $this->JourneyTimes($candidate);
-            if ($times['departure'] > 0 && $times['arrival'] <= $arrivalTs && $times['arrival'] >= $bestArrival && !$this->JourneyCancelled($candidate)) {
+            if ($times['departure'] > 0 && $times['arrival'] > 0 && $times['arrival'] <= $arrivalTs && $times['arrival'] >= $bestArrival && !$this->JourneyCancelled($candidate)) {
                 $best = $candidate;
                 $bestArrival = $times['arrival'];
             }
         }
-        return $best ?? $journeys[0];
+        return is_array($best) ? $best : $journeys[0];
     }
 
     private function RefreshJourney(string $token): array
@@ -271,23 +288,36 @@ class OchsMobility extends IPSModule
         $remarks = [];
         $delay = 0;
         $platform = '';
+
         foreach (($journey['legs'] ?? []) as $leg) {
             if (($leg['walking'] ?? false) === true) {
                 continue;
             }
             $name = trim((string) ($leg['line']['name'] ?? $leg['line']['fahrtNr'] ?? ''));
-            if ($name !== '') $summary[] = $name;
-            $platform = $platform !== '' ? $platform : (string) ($leg['departurePlatform'] ?? $leg['plannedDeparturePlatform'] ?? '');
+            if ($name !== '') {
+                $summary[] = $name;
+            }
+            if ($platform === '') {
+                $platform = (string) ($leg['departurePlatform'] ?? $leg['plannedDeparturePlatform'] ?? '');
+            }
             foreach (['departureDelay', 'arrivalDelay'] as $key) {
-                if (is_numeric($leg[$key] ?? null)) $delay = max($delay, (int) round(((int) $leg[$key]) / 60));
+                if (is_numeric($leg[$key] ?? null)) {
+                    $delay = max($delay, (int) round(((int) $leg[$key]) / 60));
+                }
             }
             foreach (($leg['remarks'] ?? []) as $remark) {
                 $text = trim((string) ($remark['text'] ?? $remark['summary'] ?? ''));
-                if ($text !== '') $remarks[] = $text;
+                if ($text !== '') {
+                    $remarks[] = $text;
+                }
             }
         }
+
         $token = (string) ($journey['refreshToken'] ?? '');
-        if ($token !== '') $this->WriteAttributeString('JourneyRefreshToken', $token);
+        if ($token !== '') {
+            $this->WriteAttributeString('JourneyRefreshToken', $token);
+        }
+
         return [
             'source' => 'transport.rest',
             'departure' => $times['departure'],
@@ -302,13 +332,37 @@ class OchsMobility extends IPSModule
         ];
     }
 
-    private function FetchTransitousJourney(int $arrivalTs): array
+    private function FetchTransitousJourney(int $arrivalTs, array &$diag): array
     {
         $from = $this->ReadCoordinates('FromCoordinates');
         $to = $this->ReadCoordinates('ToCoordinates');
-        if ($from === null || $to === null) {
-            throw new RuntimeException('Koordinaten der Haltestellen fehlen.');
+
+        if ($from === null) {
+            try {
+                $from = $this->TransitousGeocode(trim($this->ReadPropertyString('FromStopName')));
+                $this->WriteCoordinates('FromCoordinates', $from);
+                $diag[] = 'Transitous Geocoding Start: OK';
+            } catch (Throwable $e) {
+                $diag[] = 'Transitous Geocoding Start: ' . $e->getMessage();
+                throw $e;
+            }
+        } else {
+            $diag[] = 'Transitous Geocoding Start: Cache';
         }
+
+        if ($to === null) {
+            try {
+                $to = $this->TransitousGeocode(trim($this->ReadPropertyString('ToStopName')));
+                $this->WriteCoordinates('ToCoordinates', $to);
+                $diag[] = 'Transitous Geocoding Ziel: OK';
+            } catch (Throwable $e) {
+                $diag[] = 'Transitous Geocoding Ziel: ' . $e->getMessage();
+                throw $e;
+            }
+        } else {
+            $diag[] = 'Transitous Geocoding Ziel: Cache';
+        }
+
         $query = http_build_query([
             'fromPlace' => $from[0] . ',' . $from[1],
             'toPlace' => $to[0] . ',' . $to[1],
@@ -317,17 +371,22 @@ class OchsMobility extends IPSModule
             'transitModes' => 'TRANSIT',
             'detailedLegs' => 'false'
         ]);
-        $data = $this->HttpJson(self::TRANSITOUS_BASE . '/plan?' . $query, true, 'OchsMobility/0.4 https://github.com/AlexOX-80/Leave-at-home-Mobility');
+
+        $data = $this->HttpJson(self::TRANSITOUS_ROOT . '/api/v6/plan?' . $query, true, self::UA);
         $items = $data['itineraries'] ?? [];
         if (!is_array($items) || count($items) === 0) {
             throw new RuntimeException('Keine Transitous-Verbindung gefunden.');
         }
+
         $it = $items[0];
         $summary = [];
         foreach (($it['legs'] ?? []) as $leg) {
             $name = trim((string) ($leg['routeShortName'] ?? $leg['routeLongName'] ?? $leg['mode'] ?? ''));
-            if ($name !== '') $summary[] = $name;
+            if ($name !== '') {
+                $summary[] = $name;
+            }
         }
+
         return [
             'source' => 'Transitous',
             'departure' => $this->IsoToTs((string) ($it['startTime'] ?? '')),
@@ -342,19 +401,67 @@ class OchsMobility extends IPSModule
         ];
     }
 
+    private function TransitousGeocode(string $text): array
+    {
+        if ($text === '') {
+            throw new RuntimeException('Haltestellenname für Transitous fehlt.');
+        }
+
+        $query = http_build_query([
+            'text' => $text,
+            'language' => 'de',
+            'type' => 'STOP'
+        ]);
+        $data = $this->HttpJson(self::TRANSITOUS_ROOT . '/api/v1/geocode?' . $query, true, self::UA);
+        if (!is_array($data) || count($data) === 0) {
+            throw new RuntimeException('Keine Transitous-Haltestelle für „' . $text . '“ gefunden.');
+        }
+
+        $best = null;
+        $queryNorm = $this->NormalizeText($text);
+        foreach ($data as $candidate) {
+            if (!is_array($candidate)) {
+                continue;
+            }
+            $lat = $candidate['lat'] ?? $candidate['latitude'] ?? $candidate['location']['lat'] ?? $candidate['location']['latitude'] ?? null;
+            $lon = $candidate['lon'] ?? $candidate['longitude'] ?? $candidate['location']['lon'] ?? $candidate['location']['longitude'] ?? null;
+            if (!is_numeric($lat) || !is_numeric($lon)) {
+                continue;
+            }
+            $name = (string) ($candidate['name'] ?? $candidate['displayName'] ?? $candidate['label'] ?? '');
+            $nameNorm = $this->NormalizeText($name);
+            $score = $nameNorm === $queryNorm ? 100 : (strpos($nameNorm, $queryNorm) !== false ? 80 : 10);
+            if ($best === null || $score > $best['score']) {
+                $best = ['score' => $score, 'lat' => (float) $lat, 'lon' => (float) $lon];
+            }
+        }
+
+        if ($best === null) {
+            throw new RuntimeException('Transitous-Geocoding lieferte keine Koordinaten für „' . $text . '“.');
+        }
+        return [$best['lat'], $best['lon']];
+    }
+
     private function ApplyNormalizedJourney(array $journey, int $targetArrival, ?array $official, bool $stale = false): void
     {
         $departure = (int) ($journey['departure'] ?? 0);
         $arrival = (int) ($journey['arrival'] ?? 0);
-        if ($departure <= 0 || $arrival <= 0) throw new RuntimeException('Verbindung enthält keine Zeiten.');
+        if ($departure <= 0 || $arrival <= 0) {
+            throw new RuntimeException('Verbindung enthält keine verwertbaren Zeiten.');
+        }
+
         $delay = (int) ($journey['delay'] ?? 0);
         $platform = (string) ($journey['platform'] ?? '');
         $cancelled = (bool) ($journey['cancelled'] ?? false);
 
         if ($official !== null) {
-            if (($official['changedDeparture'] ?? 0) > 0) $departure = (int) $official['changedDeparture'];
+            if (($official['changedDeparture'] ?? 0) > 0) {
+                $departure = (int) $official['changedDeparture'];
+            }
             $delay = max($delay, (int) ($official['delayMinutes'] ?? 0));
-            if ((string) ($official['platform'] ?? '') !== '') $platform = (string) $official['platform'];
+            if ((string) ($official['platform'] ?? '') !== '') {
+                $platform = (string) $official['platform'];
+            }
             $cancelled = $cancelled || (bool) ($official['cancelled'] ?? false);
             $this->SetValue('DBTimetablesMatch', (string) ($official['match'] ?? ''));
             $this->SetValue('DBTimetablesDelay', (int) ($official['delayMinutes'] ?? 0));
@@ -364,6 +471,7 @@ class OchsMobility extends IPSModule
 
         $leave = $departure - ($this->ReadPropertyInteger('WalkToStopMinutes') + $this->ReadPropertyInteger('SafetyBufferMinutes')) * 60;
         $minutes = (int) floor(($leave - time()) / 60);
+
         $status = 'OK';
         $recommendation = 'Planmäßig losfahren';
         if ($stale) {
@@ -399,7 +507,9 @@ class OchsMobility extends IPSModule
         $this->SetValue('Disruptions', (string) ($journey['remarks'] ?? ''));
         $this->SetValue('JourneyTracked', (bool) ($journey['tracked'] ?? false));
         $this->SetValue('DataStale', $stale);
-        if (!$stale) $this->SetValue('LastError', '');
+        if (!$stale) {
+            $this->SetValue('LastError', '');
+        }
     }
 
     private function ResolveConfiguredStops(bool $force): array
@@ -421,25 +531,55 @@ class OchsMobility extends IPSModule
             return ['id' => $this->ReadAttributeString($idAttr), 'name' => $this->ReadAttributeString($nameAttr)];
         }
 
+        $id = $idProp;
+        $name = $nameProp;
+
         if ($idProp !== '') {
-            $station = $this->HttpJson(self::TRANSPORT_BASE . '/stations/' . rawurlencode($idProp), true);
-            $id = $idProp;
-            $name = $nameProp !== '' ? $nameProp : (string) ($station['name'] ?? $idProp);
-            $this->StoreCoordinates($coordAttr, $station['location'] ?? []);
+            try {
+                $station = $this->HttpJson(self::TRANSPORT_BASE . '/stations/' . rawurlencode($idProp), true);
+                if ($name === '') {
+                    $name = (string) ($station['name'] ?? $idProp);
+                }
+                $this->StoreCoordinates($coordAttr, $station['location'] ?? []);
+            } catch (Throwable $e) {
+                if ($name === '') {
+                    $name = $idProp;
+                }
+            }
         } else {
-            if ($nameProp === '') throw new RuntimeException($side . '-Haltestelle fehlt.');
+            if ($nameProp === '') {
+                throw new RuntimeException($side . '-Haltestelle fehlt.');
+            }
             $data = $this->HttpJson(self::TRANSPORT_BASE . '/stations?' . http_build_query(['query' => $nameProp, 'limit' => 5, 'fuzzy' => 'true']), true);
             $best = null;
             foreach ($data as $candidate) {
-                if (!is_array($candidate) || empty($candidate['id'])) continue;
+                if (!is_array($candidate) || empty($candidate['id'])) {
+                    continue;
+                }
                 $score = $this->NormalizeText((string) ($candidate['name'] ?? '')) === $this->NormalizeText($nameProp) ? 100 : (int) round(((float) ($candidate['relevance'] ?? 0)) * 80);
-                if ($best === null || $score > $best['score']) $best = ['score' => $score, 'data' => $candidate];
+                if ($best === null || $score > $best['score']) {
+                    $best = ['score' => $score, 'data' => $candidate];
+                }
             }
-            if ($best === null) throw new RuntimeException('Keine Haltestelle für „' . $nameProp . '“ gefunden.');
+            if ($best === null) {
+                throw new RuntimeException('Keine Haltestelle für „' . $nameProp . '“ gefunden.');
+            }
             $station = $best['data'];
             $id = (string) $station['id'];
             $name = (string) ($station['name'] ?? $nameProp);
             $this->StoreCoordinates($coordAttr, $station['location'] ?? []);
+        }
+
+        if ($name === '') {
+            $name = $id;
+        }
+
+        if ($this->ReadCoordinates($coordAttr) === null && $nameProp !== '') {
+            try {
+                $coords = $this->TransitousGeocode($nameProp);
+                $this->WriteCoordinates($coordAttr, $coords);
+            } catch (Throwable $e) {
+            }
         }
 
         $this->WriteAttributeString($idAttr, $id);
@@ -452,31 +592,54 @@ class OchsMobility extends IPSModule
     {
         $leg = null;
         foreach (($journey['legs'] ?? []) as $candidate) {
-            if (($candidate['walking'] ?? false) !== true && isset($candidate['line'])) { $leg = $candidate; break; }
+            if (($candidate['walking'] ?? false) !== true && isset($candidate['line'])) {
+                $leg = $candidate;
+                break;
+            }
         }
-        if ($leg === null) return null;
+        if ($leg === null) {
+            return null;
+        }
         $plannedTs = $this->IsoToTs((string) ($leg['plannedDeparture'] ?? $leg['departure'] ?? ''));
-        if ($plannedTs <= 0) return null;
+        if ($plannedTs <= 0) {
+            return null;
+        }
         $eva = $this->ResolveDBEva();
-        if ($eva === '') return null;
+        if ($eva === '') {
+            return null;
+        }
 
         $url = self::DB_TIMETABLES_BASE . '/plan/' . rawurlencode($eva) . '/' . date('ymd', $plannedTs) . '/' . date('H', $plannedTs);
         $plan = $this->HttpXml($url);
-        $best = null; $score = PHP_INT_MAX;
+        $best = null;
+        $score = PHP_INT_MAX;
         foreach ($plan->s as $stop) {
-            if (!isset($stop->dp)) continue;
+            if (!isset($stop->dp)) {
+                continue;
+            }
             $pt = $this->IrisTimeToTs((string) $stop->dp['pt']);
             $delta = abs($pt - $plannedTs);
-            if ($pt > 0 && $delta < $score) { $best = $stop; $score = $delta; }
+            if ($pt > 0 && $delta < $score) {
+                $best = $stop;
+                $score = $delta;
+            }
         }
-        if ($best === null || $score > 5400) return null;
+        if ($best === null || $score > 5400) {
+            return null;
+        }
 
-        $changed = 0; $platform = (string) $best->dp['pp']; $cancelled = false;
+        $changed = 0;
+        $platform = (string) $best->dp['pp'];
+        $cancelled = false;
         $changes = $this->HttpXml(self::DB_TIMETABLES_BASE . '/fchg/' . rawurlencode($eva));
         foreach ($changes->s as $stop) {
-            if ((string) $stop['id'] !== (string) $best['id'] || !isset($stop->dp)) continue;
+            if ((string) $stop['id'] !== (string) $best['id'] || !isset($stop->dp)) {
+                continue;
+            }
             $changed = $this->IrisTimeToTs((string) $stop->dp['ct']);
-            if ((string) $stop->dp['cp'] !== '') $platform = (string) $stop->dp['cp'];
+            if ((string) $stop->dp['cp'] !== '') {
+                $platform = (string) $stop->dp['cp'];
+            }
             $cancelled = strtolower((string) $stop->dp['cs']) === 'c';
             break;
         }
@@ -494,17 +657,28 @@ class OchsMobility extends IPSModule
     private function ResolveDBEva(): string
     {
         $override = trim($this->ReadPropertyString('DBEvaNumber'));
-        if ($override !== '') return $override;
+        if ($override !== '') {
+            return $override;
+        }
         $cached = $this->ReadAttributeString('ResolvedDBEva');
-        if ($cached !== '') return $cached;
+        if ($cached !== '') {
+            return $cached;
+        }
         $name = $this->ReadAttributeString('ResolvedFromStopName');
-        if ($name === '') return '';
+        if ($name === '') {
+            return '';
+        }
         $xml = $this->HttpXml(self::DB_TIMETABLES_BASE . '/station/' . rawurlencode($name));
         $best = '';
         foreach ($xml->station as $station) {
-            if ((string) $station['eva'] !== '') { $best = (string) $station['eva']; break; }
+            if ((string) $station['eva'] !== '') {
+                $best = (string) $station['eva'];
+                break;
+            }
         }
-        if ($best !== '') $this->WriteAttributeString('ResolvedDBEva', $best);
+        if ($best !== '') {
+            $this->WriteAttributeString('ResolvedDBEva', $best);
+        }
         return $best;
     }
 
@@ -519,27 +693,33 @@ class OchsMobility extends IPSModule
             $this->SetValue('RoadworksSummary', 'Koordinaten für Straßenkorridor nicht vollständig konfiguriert');
             return;
         }
+
         $geo = $this->HttpJson(self::MOBIDATA_ROADWORKS);
         $hits = [];
         foreach (($geo['features'] ?? []) as $feature) {
             $p = $feature['properties'] ?? [];
-            $text = '';
-            foreach (['description','title','comment','reason','street','road','name'] as $key) {
-                if (isset($p[$key]) && trim((string) $p[$key]) !== '') { $text = trim((string) $p[$key]); break; }
+            foreach (['description', 'title', 'comment', 'reason', 'street', 'road', 'name'] as $key) {
+                if (isset($p[$key]) && trim((string) $p[$key]) !== '') {
+                    $hits[] = trim((string) $p[$key]);
+                    break;
+                }
             }
-            if ($text !== '') $hits[] = $text;
-            if (count($hits) >= 10) break;
+            if (count($hits) >= 10) {
+                break;
+            }
         }
         $hits = array_values(array_unique($hits));
         $this->SetValue('RoadworksCount', count($hits));
         $this->SetValue('RoadworksSummary', count($hits) ? implode(' | ', $hits) : 'Keine Straßenmeldung erkannt');
     }
 
-    private function HttpJson(string $url, bool $retry = false, string $userAgent = 'IP-Symcon OchsMobility/0.4'): array
+    private function HttpJson(string $url, bool $retry = false, string $userAgent = 'IP-Symcon OchsMobility/0.5'): array
     {
         $body = $this->HttpRequest($url, ['Accept: application/json'], $retry, $userAgent);
         $data = json_decode($body, true);
-        if (!is_array($data)) throw new RuntimeException('Ungültiges JSON.');
+        if (!is_array($data)) {
+            throw new RuntimeException('Ungültiges JSON.');
+        }
         return $data;
     }
 
@@ -554,25 +734,45 @@ class OchsMobility extends IPSModule
         libxml_use_internal_errors(true);
         $xml = simplexml_load_string($body);
         libxml_clear_errors();
-        if ($xml === false) throw new RuntimeException('Ungültiges XML.');
+        if ($xml === false) {
+            throw new RuntimeException('Ungültiges XML.');
+        }
         return $xml;
     }
 
-    private function HttpRequest(string $url, array $headers, bool $retry = false, string $userAgent = 'IP-Symcon OchsMobility/0.4'): string
+    private function HttpRequest(string $url, array $headers, bool $retry = false, string $userAgent = 'IP-Symcon OchsMobility/0.5'): string
     {
         $attempts = $retry ? 3 : 1;
         $last = 'Unbekannter HTTP-Fehler';
+
         for ($i = 0; $i < $attempts; $i++) {
             $ch = curl_init($url);
-            curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_FOLLOWLOCATION => true, CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_TIMEOUT => 18, CURLOPT_USERAGENT => $userAgent, CURLOPT_HTTPHEADER => $headers]);
+            if ($ch === false) {
+                throw new RuntimeException('HTTP-Client konnte nicht initialisiert werden.');
+            }
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_CONNECTTIMEOUT => 8,
+                CURLOPT_TIMEOUT => 18,
+                CURLOPT_USERAGENT => $userAgent,
+                CURLOPT_HTTPHEADER => $headers
+            ]);
             $body = curl_exec($ch);
             $error = curl_error($ch);
             $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
-            if ($body !== false && $error === '' && $status >= 200 && $status < 300) return (string) $body;
+
+            if ($body !== false && $error === '' && $status >= 200 && $status < 300) {
+                return (string) $body;
+            }
             $last = $error !== '' ? $error : 'HTTP ' . $status;
-            if (!in_array($status, [429, 502, 503, 504], true)) break;
-            if ($i + 1 < $attempts) usleep(($i + 1) * 350000);
+            if (!in_array($status, [429, 502, 503, 504], true)) {
+                break;
+            }
+            if ($i + 1 < $attempts) {
+                usleep(($i + 1) * 350000);
+            }
         }
         throw new RuntimeException($last);
     }
@@ -580,20 +780,31 @@ class OchsMobility extends IPSModule
     private function JourneyTimes(array $journey): array
     {
         $legs = $journey['legs'] ?? [];
-        if (!is_array($legs) || count($legs) === 0) return ['departure' => 0, 'arrival' => 0];
-        $first = $legs[0]; $last = $legs[count($legs) - 1];
-        return ['departure' => $this->IsoToTs((string) ($first['departure'] ?? $first['plannedDeparture'] ?? '')), 'arrival' => $this->IsoToTs((string) ($last['arrival'] ?? $last['plannedArrival'] ?? ''))];
+        if (!is_array($legs) || count($legs) === 0) {
+            return ['departure' => 0, 'arrival' => 0];
+        }
+        $first = $legs[0];
+        $last = $legs[count($legs) - 1];
+        return [
+            'departure' => $this->IsoToTs((string) ($first['departure'] ?? $first['plannedDeparture'] ?? '')),
+            'arrival' => $this->IsoToTs((string) ($last['arrival'] ?? $last['plannedArrival'] ?? ''))
+        ];
     }
 
     private function JourneyCancelled(array $journey): bool
     {
-        foreach (($journey['legs'] ?? []) as $leg) if (($leg['cancelled'] ?? false) === true) return true;
+        foreach (($journey['legs'] ?? []) as $leg) {
+            if (($leg['cancelled'] ?? false) === true) {
+                return true;
+            }
+        }
         return false;
     }
 
     private function SaveCachedJourney(array $journey): void
     {
-        $copy = $journey; unset($copy['rawTransport']);
+        $copy = $journey;
+        unset($copy['rawTransport']);
         $this->WriteAttributeString('CachedJourney', json_encode($copy));
         $this->WriteAttributeInteger('CachedJourneyAt', time());
     }
@@ -601,26 +812,41 @@ class OchsMobility extends IPSModule
     private function LoadCachedJourney(): ?array
     {
         $age = time() - $this->ReadAttributeInteger('CachedJourneyAt');
-        if ($age < 0 || $age > max(5, $this->ReadPropertyInteger('StaleCacheMinutes')) * 60) return null;
+        if ($age < 0 || $age > max(5, $this->ReadPropertyInteger('StaleCacheMinutes')) * 60) {
+            return null;
+        }
         $data = json_decode($this->ReadAttributeString('CachedJourney'), true);
         return is_array($data) ? $data : null;
     }
 
     private function StoreCoordinates(string $attribute, array $location): void
     {
-        $lat = $location['latitude'] ?? null; $lon = $location['longitude'] ?? null;
-        if (is_numeric($lat) && is_numeric($lon)) $this->WriteAttributeString($attribute, (float) $lat . ',' . (float) $lon);
+        $lat = $location['latitude'] ?? null;
+        $lon = $location['longitude'] ?? null;
+        if (is_numeric($lat) && is_numeric($lon)) {
+            $this->WriteCoordinates($attribute, [(float) $lat, (float) $lon]);
+        }
+    }
+
+    private function WriteCoordinates(string $attribute, array $coords): void
+    {
+        if (count($coords) >= 2 && is_numeric($coords[0]) && is_numeric($coords[1])) {
+            $this->WriteAttributeString($attribute, (float) $coords[0] . ',' . (float) $coords[1]);
+        }
     }
 
     private function ReadCoordinates(string $attribute): ?array
     {
         $parts = explode(',', $this->ReadAttributeString($attribute));
-        return count($parts) === 2 && is_numeric($parts[0]) && is_numeric($parts[1]) ? [(float) $parts[0], (float) $parts[1]] : null;
+        return count($parts) === 2 && is_numeric($parts[0]) && is_numeric($parts[1])
+            ? [(float) $parts[0], (float) $parts[1]]
+            : null;
     }
 
     private function HasStopConfiguration(): bool
     {
-        return (trim($this->ReadPropertyString('FromStopId')) !== '' || trim($this->ReadPropertyString('FromStopName')) !== '') && (trim($this->ReadPropertyString('ToStopId')) !== '' || trim($this->ReadPropertyString('ToStopName')) !== '');
+        return (trim($this->ReadPropertyString('FromStopId')) !== '' || trim($this->ReadPropertyString('FromStopName')) !== '')
+            && (trim($this->ReadPropertyString('ToStopId')) !== '' || trim($this->ReadPropertyString('ToStopName')) !== '');
     }
 
     private function HasDBCredentials(): bool
@@ -647,13 +873,22 @@ class OchsMobility extends IPSModule
 
     private function ConfigurationSignature(): string
     {
-        return sha1(implode('|', [trim($this->ReadPropertyString('FromStopName')), trim($this->ReadPropertyString('ToStopName')), trim($this->ReadPropertyString('FromStopId')), trim($this->ReadPropertyString('ToStopId')), trim($this->ReadPropertyString('DBEvaNumber'))]));
+        return sha1(implode('|', [
+            trim($this->ReadPropertyString('FromStopName')),
+            trim($this->ReadPropertyString('ToStopName')),
+            trim($this->ReadPropertyString('FromStopId')),
+            trim($this->ReadPropertyString('ToStopId')),
+            trim($this->ReadPropertyString('DBEvaNumber'))
+        ]));
     }
 
     private function ClearResolvedStops(): void
     {
-        foreach (['ResolvedFromStopId','ResolvedToStopId','ResolvedFromStopName','ResolvedToStopName','FromCoordinates','ToCoordinates'] as $a) $this->WriteAttributeString($a, '');
-        $this->SetValue('ResolvedFrom', ''); $this->SetValue('ResolvedTo', '');
+        foreach (['ResolvedFromStopId', 'ResolvedToStopId', 'ResolvedFromStopName', 'ResolvedToStopName', 'FromCoordinates', 'ToCoordinates'] as $a) {
+            $this->WriteAttributeString($a, '');
+        }
+        $this->SetValue('ResolvedFrom', '');
+        $this->SetValue('ResolvedTo', '');
     }
 
     private function ClearTrackedJourney(): void
