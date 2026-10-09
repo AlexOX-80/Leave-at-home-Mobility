@@ -1,0 +1,12 @@
+{
+  "id": "{A1A08B8B-C020-4E8F-9B68-A86B9EB2E021}",
+  "author": "Alexander Ochs / OpenAI",
+  "name": "Ochs Smart Home Mobility",
+  "url": "https://github.com/AlexOX-80/Leave-at-home-Mobility",
+  "compatibility": {
+    "version": "8.0"
+  },
+  "version": "0.1",
+  "build": 1,
+  "date": 1791582400
+}
