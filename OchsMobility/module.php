@@ -13,8 +13,8 @@ class OchsMobility extends IPSModule
 
         $this->RegisterPropertyString('FromStopName', '');
         $this->RegisterPropertyString('ToStopName', '');
-        $this->RegisterPropertyString('FromStopId', ''); // EVA preferred
-        $this->RegisterPropertyString('ToStopId', '');   // EVA preferred
+        $this->RegisterPropertyString('FromStopId', '');
+        $this->RegisterPropertyString('ToStopId', '');
         $this->RegisterPropertyInteger('WalkToStopMinutes', 8);
         $this->RegisterPropertyInteger('SafetyBufferMinutes', 5);
         $this->RegisterPropertyInteger('DefaultArrivalLeadMinutes', 60);
@@ -121,7 +121,6 @@ class OchsMobility extends IPSModule
         }
 
         $this->SetValue('ProviderDiagnostics', 'DB Timetables: Aktualisierung läuft …');
-
         $target = $this->ReadAttributeInteger('TargetArrival');
         if ($target <= time()) {
             $target = time() + max(15, $this->ReadPropertyInteger('DefaultArrivalLeadMinutes')) * 60;
@@ -138,7 +137,7 @@ class OchsMobility extends IPSModule
             $this->ApplyJourney($journey, $target);
             $this->SetValue('DBTimetablesStatus', 'Offizielle DB-Daten aktiv');
             $this->SetValue('RoutingProvider', 'DB Timetables');
-            $this->SetValue('ProviderDiagnostics', 'DB Timetables: OK · direkte Fahrt gefunden');
+            $this->SetValue('ProviderDiagnostics', 'DB Timetables: OK · direkte Fahrt gefunden · Auswahl=' . ($journey['selection'] ?? '')); 
 
             try {
                 if ($this->ReadPropertyBoolean('EnableRoadworks')) {
@@ -166,22 +165,12 @@ class OchsMobility extends IPSModule
     {
         $id = trim($this->ReadPropertyString($side . 'StopId'));
         $name = trim($this->ReadPropertyString($side . 'StopName'));
-        $cachedEvaAttr = 'Resolved' . $side . 'Eva';
-        $cachedNameAttr = 'Resolved' . $side . 'Name';
-
-        if ($id !== '') {
-            $xml = $this->HttpXml(self::DB_TIMETABLES_BASE . '/station/' . rawurlencode($id));
-        } elseif ($name !== '') {
-            $xml = $this->HttpXml(self::DB_TIMETABLES_BASE . '/station/' . rawurlencode($name));
-        } else {
-            throw new RuntimeException($side === 'From' ? 'Startbahnhof fehlt.' : 'Zielbahnhof fehlt.');
-        }
+        $xml = $this->HttpXml(self::DB_TIMETABLES_BASE . '/station/' . rawurlencode($id !== '' ? $id : $name));
 
         $bestEva = '';
         $bestName = '';
         $queryNorm = $this->NormalizeText($name !== '' ? $name : $id);
         $bestScore = -1;
-
         foreach ($xml->station as $station) {
             $eva = trim((string) $station['eva']);
             $stationName = trim((string) $station['name']);
@@ -199,24 +188,23 @@ class OchsMobility extends IPSModule
                 $bestName = $stationName !== '' ? $stationName : ($name !== '' ? $name : $eva);
             }
         }
-
         if ($bestEva === '') {
             throw new RuntimeException('DB Timetables konnte ' . ($side === 'From' ? 'Startbahnhof' : 'Zielbahnhof') . ' nicht auflösen.');
         }
 
-        $this->WriteAttributeString($cachedEvaAttr, $bestEva);
-        $this->WriteAttributeString($cachedNameAttr, $bestName);
+        $this->WriteAttributeString('Resolved' . $side . 'Eva', $bestEva);
+        $this->WriteAttributeString('Resolved' . $side . 'Name', $bestName);
         return [$bestEva, $bestName];
     }
 
     private function FindDirectJourney(string $fromEva, string $fromName, string $toEva, string $toName, int $targetArrival): array
     {
         $hours = max(1, min(8, $this->ReadPropertyInteger('LookAheadHours')));
-        $start = time() - 3600;
-        $end = max($targetArrival + 3600, time() + ($hours * 3600));
+        $searchStart = time() - 300;
+        $searchEnd = max(time() + ($hours * 3600), $targetArrival + 3600);
         $plans = [];
 
-        for ($t = strtotime(date('Y-m-d H:00:00', $start)); $t <= $end; $t += 3600) {
+        for ($t = strtotime(date('Y-m-d H:00:00', $searchStart)); $t <= $searchEnd; $t += 3600) {
             $xml = $this->HttpXml(self::DB_TIMETABLES_BASE . '/plan/' . rawurlencode($fromEva) . '/' . date('ymd', $t) . '/' . date('H', $t));
             foreach ($xml->s as $stop) {
                 if (!isset($stop->dp)) {
@@ -227,7 +215,7 @@ class OchsMobility extends IPSModule
                     continue;
                 }
                 $plannedDeparture = $this->IrisTimeToTs((string) $stop->dp['pt']);
-                if ($plannedDeparture <= time() - 300) {
+                if ($plannedDeparture < $searchStart) {
                     continue;
                 }
                 $plans[] = [
@@ -235,12 +223,11 @@ class OchsMobility extends IPSModule
                     'plannedDeparture' => $plannedDeparture,
                     'plannedPlatform' => (string) $stop->dp['pp'],
                     'path' => $path,
-                    'category' => isset($stop->tl) ? (string) $stop->tl['c'] : '',
-                    'number' => isset($stop->tl) ? (string) $stop->tl['n'] : ''
+                    'category' => isset($stop->tl) ? trim((string) $stop->tl['c']) : '',
+                    'number' => isset($stop->tl) ? trim((string) $stop->tl['n']) : ''
                 ];
             }
         }
-
         if (count($plans) === 0) {
             throw new RuntimeException('Keine direkte DB-Fahrt von ' . $fromName . ' nach ' . $toName . ' im Suchfenster gefunden.');
         }
@@ -251,25 +238,24 @@ class OchsMobility extends IPSModule
             $changeMap[(string) $stop['id']] = $stop;
         }
 
-        $best = null;
+        $candidates = [];
         foreach ($plans as $plan) {
             $actualDeparture = $plan['plannedDeparture'];
             $platform = $plan['plannedPlatform'];
             $cancelled = false;
             $remarks = [];
-
             if (isset($changeMap[$plan['id']])) {
                 $change = $changeMap[$plan['id']];
                 if (isset($change->dp)) {
-                    $ct = (string) $change->dp['ct'];
+                    $ct = trim((string) $change->dp['ct']);
                     if ($ct !== '') {
                         $actualDeparture = $this->IrisTimeToTs($ct);
                     }
-                    $cp = (string) $change->dp['cp'];
+                    $cp = trim((string) $change->dp['cp']);
                     if ($cp !== '') {
                         $platform = $cp;
                     }
-                    $cancelled = strtolower((string) $change->dp['cs']) === 'c';
+                    $cancelled = strtolower(trim((string) $change->dp['cs'])) === 'c';
                     foreach ($change->dp->m as $m) {
                         $cat = trim((string) $m['cat']);
                         if ($cat !== '') {
@@ -278,74 +264,119 @@ class OchsMobility extends IPSModule
                     }
                 }
             }
-
-            $estimatedArrival = $this->EstimateArrivalAtDestination($plan, $toEva, $toName, $targetArrival);
-            if ($estimatedArrival <= 0) {
-                $estimatedArrival = $actualDeparture;
-            }
-
-            $candidate = [
-                'departure' => $actualDeparture,
-                'plannedDeparture' => $plan['plannedDeparture'],
-                'arrival' => $estimatedArrival,
-                'platform' => $platform,
-                'cancelled' => $cancelled,
-                'delay' => max(0, (int) round(($actualDeparture - $plan['plannedDeparture']) / 60)),
-                'category' => $plan['category'],
-                'number' => $plan['number'],
-                'remarks' => implode(' | ', array_unique($remarks)),
-                'path' => $plan['path']
-            ];
-
             if ($cancelled) {
                 continue;
             }
-            if ($best === null) {
-                $best = $candidate;
+
+            $arrivalInfo = $this->FindArrivalAtDestination($plan, $toEva, $fromName);
+            if ($arrivalInfo === null) {
                 continue;
             }
-            $candFits = $candidate['arrival'] <= $targetArrival;
-            $bestFits = $best['arrival'] <= $targetArrival;
-            if ($candFits && !$bestFits) {
-                $best = $candidate;
-            } elseif ($candFits === $bestFits && $candidate['departure'] > $best['departure']) {
-                $best = $candidate;
+
+            $arrival = $arrivalInfo['arrival'];
+            $arrivalDelay = $arrivalInfo['delay'];
+            $departureDelay = max(0, (int) round(($actualDeparture - $plan['plannedDeparture']) / 60));
+            $candidates[] = [
+                'departure' => $actualDeparture,
+                'plannedDeparture' => $plan['plannedDeparture'],
+                'arrival' => $arrival,
+                'platform' => $platform,
+                'cancelled' => false,
+                'delay' => max($departureDelay, $arrivalDelay),
+                'category' => $plan['category'],
+                'number' => $plan['number'],
+                'remarks' => implode(' | ', array_unique($remarks)),
+                'path' => $plan['path'],
+                'selection' => ''
+            ];
+        }
+
+        if (count($candidates) === 0) {
+            throw new RuntimeException('Direktfahrten gefunden, aber keine Zielankunft konnte eindeutig zugeordnet werden.');
+        }
+
+        $fitting = array_values(array_filter($candidates, static function (array $c) use ($targetArrival): bool {
+            return $c['arrival'] <= $targetArrival;
+        }));
+
+        if (count($fitting) > 0) {
+            usort($fitting, static function (array $a, array $b): int {
+                if ($a['departure'] === $b['departure']) {
+                    return $b['arrival'] <=> $a['arrival'];
+                }
+                return $b['departure'] <=> $a['departure'];
+            });
+            $best = $fitting[0];
+            $best['selection'] = 'späteste Fahrt mit Ankunft vor Wunschzeit';
+            return $best;
+        }
+
+        usort($candidates, static function (array $a, array $b): int {
+            if ($a['departure'] === $b['departure']) {
+                return $a['arrival'] <=> $b['arrival'];
             }
-        }
-
-        if ($best === null) {
-            throw new RuntimeException('Alle gefundenen direkten DB-Fahrten sind ausgefallen.');
-        }
-
+            return $a['departure'] <=> $b['departure'];
+        });
+        $best = $candidates[0];
+        $best['selection'] = 'nächste verfügbare Direktfahrt';
         return $best;
     }
 
-    private function EstimateArrivalAtDestination(array $originPlan, string $toEva, string $toName, int $targetArrival): int
+    private function FindArrivalAtDestination(array $originPlan, string $toEva, string $fromName): ?array
     {
-        $fromTs = $originPlan['plannedDeparture'];
-        $limit = min($targetArrival + 7200, $fromTs + 21600);
+        $fromTs = (int) $originPlan['plannedDeparture'];
+        $limit = $fromTs + 21600;
+        $targetChanges = null;
+        try {
+            $targetChanges = $this->HttpXml(self::DB_TIMETABLES_BASE . '/fchg/' . rawurlencode($toEva));
+        } catch (Throwable $e) {
+            $targetChanges = null;
+        }
+        $changeMap = [];
+        if ($targetChanges !== null) {
+            foreach ($targetChanges->s as $s) {
+                $changeMap[(string) $s['id']] = $s;
+            }
+        }
+
         for ($t = strtotime(date('Y-m-d H:00:00', $fromTs)); $t <= $limit; $t += 3600) {
             $xml = $this->HttpXml(self::DB_TIMETABLES_BASE . '/plan/' . rawurlencode($toEva) . '/' . date('ymd', $t) . '/' . date('H', $t));
             foreach ($xml->s as $stop) {
                 if (!isset($stop->ar)) {
                     continue;
                 }
-                $category = isset($stop->tl) ? (string) $stop->tl['c'] : '';
-                $number = isset($stop->tl) ? (string) $stop->tl['n'] : '';
-                if ($category !== $originPlan['category'] || $number !== $originPlan['number']) {
+                $category = isset($stop->tl) ? trim((string) $stop->tl['c']) : '';
+                $number = isset($stop->tl) ? trim((string) $stop->tl['n']) : '';
+                if ($category !== $originPlan['category'] || ltrim($number, '0') !== ltrim($originPlan['number'], '0')) {
                     continue;
                 }
+
+                $plannedArrival = $this->IrisTimeToTs((string) $stop->ar['pt']);
+                if ($plannedArrival < $fromTs || $plannedArrival > $limit) {
+                    continue;
+                }
+
                 $path = (string) $stop->ar['ppth'];
-                if (!$this->PathContainsStation($path, $this->ReadAttributeString('ResolvedFromName'))) {
+                if ($path !== '' && !$this->PathContainsStation($path, $fromName)) {
                     continue;
                 }
-                $arrival = $this->IrisTimeToTs((string) $stop->ar['pt']);
-                if ($arrival >= $fromTs) {
-                    return $arrival;
+
+                $actualArrival = $plannedArrival;
+                $id = (string) $stop['id'];
+                if (isset($changeMap[$id]) && isset($changeMap[$id]->ar)) {
+                    $ct = trim((string) $changeMap[$id]->ar['ct']);
+                    if ($ct !== '') {
+                        $actualArrival = $this->IrisTimeToTs($ct);
+                    }
                 }
+
+                return [
+                    'arrival' => $actualArrival,
+                    'delay' => max(0, (int) round(($actualArrival - $plannedArrival) / 60))
+                ];
             }
         }
-        return 0;
+        return null;
     }
 
     private function ApplyJourney(array $journey, int $targetArrival): void
@@ -360,7 +391,7 @@ class OchsMobility extends IPSModule
             $recommendation = 'Direkte DB-Fahrt ist ausgefallen';
         } elseif ($journey['arrival'] > $targetArrival) {
             $status = 'ZU SPÄT';
-            $recommendation = 'Direkte Fahrt erreicht das Ziel nach der Wunschzeit';
+            $recommendation = 'Keine Direktfahrt erreicht die Wunschzeit; nächste Fahrt gewählt';
         } elseif ($minutes <= 0) {
             $status = 'JETZT LOS';
             $recommendation = 'Jetzt das Haus verlassen';
@@ -384,7 +415,7 @@ class OchsMobility extends IPSModule
         $this->SetValue('Platform', $journey['platform']);
         $this->SetValue('Cancelled', $journey['cancelled']);
         $this->SetValue('Disruptions', $journey['remarks']);
-        $this->SetValue('DBTimetablesMatch', $label . ' · ' . date('H:i', $journey['departure']));
+        $this->SetValue('DBTimetablesMatch', $label . ' · ' . date('H:i', $journey['departure']) . ' → ' . date('H:i', $journey['arrival']));
     }
 
     private function PathContainsStation(string $path, string $stationName): bool
@@ -456,7 +487,7 @@ class OchsMobility extends IPSModule
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_CONNECTTIMEOUT => 8,
             CURLOPT_TIMEOUT => 18,
-            CURLOPT_USERAGENT => 'IP-Symcon OchsMobility/0.6',
+            CURLOPT_USERAGENT => 'IP-Symcon OchsMobility/0.7',
             CURLOPT_HTTPHEADER => $headers
         ]);
         $body = curl_exec($ch);
